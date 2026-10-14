@@ -15,6 +15,7 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Mount
 
 from arxiv_client import ArxivClient
+from prompts import PROMPTS
 from tools import TOOL_REGISTRY
 
 # stdout is the MCP channel in stdio mode, so log to stderr (the default handler does)
@@ -25,6 +26,9 @@ app = Server("arxiv-mcp")
 client = ArxivClient()
 
 
+# ==========================================
+# TOOLS
+# ==========================================
 @app.list_tools()
 async def handle_list_tools():
     return [
@@ -42,15 +46,59 @@ async def handle_call_tool(name: str, arguments: dict | None):
     logger.info("CALL_TOOL %s %s", name, arguments)
 
     try:
-        params = tool["builder"](arguments or {})
+        result = await tool["handler"](client, arguments or {})
     except ValueError as e:
         result = {"error": "INVALID_ARGUMENTS", "detail": str(e)}
-    else:
-        result = await client.query(params)
+    except Exception as e:
+        logger.exception("Tool %s failed", name)
+        result = {"error": "INTERNAL_ERROR", "detail": str(e)}
 
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+    return [types.TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
 
+# ==========================================
+# PROMPTS
+# ==========================================
+@app.list_prompts()
+async def handle_list_prompts():
+    return [
+        types.Prompt(
+            name=name,
+            description=p["description"],
+            arguments=[
+                types.PromptArgument(name=a["name"], description=a["description"], required=a["required"])
+                for a in p["arguments"]
+            ],
+        )
+        for name, p in PROMPTS.items()
+    ]
+
+
+@app.get_prompt()
+async def handle_get_prompt(name: str, arguments: dict[str, str] | None):
+    prompt = PROMPTS.get(name)
+    if prompt is None:
+        raise ValueError(f"Unknown prompt: {name}")
+
+    arguments = arguments or {}
+    missing = [a["name"] for a in prompt["arguments"] if a["required"] and not arguments.get(a["name"])]
+    if missing:
+        raise ValueError(f"Missing required argument(s): {', '.join(missing)}")
+
+    return types.GetPromptResult(
+        description=prompt["description"],
+        messages=[
+            types.PromptMessage(
+                role="user",
+                content=types.TextContent(type="text", text=prompt["render"](arguments)),
+            )
+        ],
+    )
+
+
+# ==========================================
+# TRANSPORTS
+# ==========================================
 async def serve_http(port: int):
     session_manager = StreamableHTTPSessionManager(app=app, json_response=False, stateless=False)
 

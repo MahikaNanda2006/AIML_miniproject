@@ -24,6 +24,10 @@ def normalize_id(raw: str) -> str:
     return re.sub(r"\.pdf$", "", s, flags=re.I)
 
 
+def strip_version(arxiv_id: str) -> str:
+    return re.sub(r"v\d+$", "", arxiv_id)
+
+
 def _text(el: Optional[ET.Element]) -> str:
     # arXiv wraps titles/abstracts with newlines and double spaces
     return " ".join((el.text or "").split()) if el is not None else ""
@@ -39,13 +43,16 @@ class ArxivClient:
     """
 
     BASE_URL = "https://export.arxiv.org/api/query"
+    PDF_URL = "https://arxiv.org/pdf/{id}"
     MIN_INTERVAL = 3.0
 
     def __init__(self):
         self._lock = asyncio.Lock()
         self._last_request = 0.0
 
-    async def _throttled_get(self, params: Dict[str, Any]) -> httpx.Response:
+    async def _throttled_get(
+        self, url: str, params: Optional[Dict[str, Any]] = None, timeout: float = 20.0
+    ) -> httpx.Response:
         async with self._lock:
             headers = {"User-Agent": "arxiv-mcp-server/1.0"}
             for attempt in range(3):
@@ -53,14 +60,17 @@ class ArxivClient:
                 if wait > 0:
                     await asyncio.sleep(wait)
 
-                async with httpx.AsyncClient(follow_redirects=True) as client:
-                    response = await client.get(
-                        self.BASE_URL, params=params, headers=headers, timeout=20.0
-                    )
-                self._last_request = time.monotonic()
+                try:
+                    async with httpx.AsyncClient(follow_redirects=True) as client:
+                        response = await client.get(url, params=params, headers=headers, timeout=timeout)
+                finally:
+                    self._last_request = time.monotonic()
 
                 if response.status_code in (429, 503) and attempt < 2:
-                    delay = float(response.headers.get("Retry-After", 5))
+                    try:
+                        delay = float(response.headers.get("Retry-After", 5))
+                    except ValueError:
+                        delay = 5.0
                     logger.warning("arXiv returned %s, retrying in %ss", response.status_code, delay)
                     await asyncio.sleep(delay)
                     continue
@@ -70,7 +80,7 @@ class ArxivClient:
     async def query(self, params: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("ARXIV QUERY: %s", params)
         try:
-            response = await self._throttled_get(params)
+            response = await self._throttled_get(self.BASE_URL, params)
         except httpx.TimeoutException:
             return {"error": "TIMEOUT", "detail": "arXiv took too long to respond"}
         except Exception as e:
@@ -88,6 +98,35 @@ class ArxivClient:
             return self._parse_feed(response.text)
         except ET.ParseError as e:
             return {"error": "PARSE_ERROR", "detail": str(e)}
+
+    async def get_paper(self, arxiv_id: str) -> Dict[str, Any]:
+        """Returns {"paper": {...}} or an error dict."""
+        result = await self.query({"id_list": normalize_id(arxiv_id), "max_results": 1})
+        if "error" in result:
+            return result
+        if not result["papers"]:
+            return {"error": "NOT_FOUND", "detail": f"No paper found for id '{arxiv_id}'"}
+        return {"paper": result["papers"][0]}
+
+    async def fetch_pdf(self, arxiv_id: str) -> Dict[str, Any]:
+        """Returns {"content": bytes} or an error dict."""
+        url = self.PDF_URL.format(id=normalize_id(arxiv_id))
+        logger.info("ARXIV PDF: %s", url)
+        try:
+            response = await self._throttled_get(url, timeout=60.0)
+        except httpx.TimeoutException:
+            return {"error": "TIMEOUT", "detail": "PDF download timed out"}
+        except Exception as e:
+            logger.exception("PDF request failed")
+            return {"error": "REQUEST_FAILED", "detail": str(e)}
+
+        if response.status_code == 404:
+            return {"error": "NOT_FOUND", "detail": f"No PDF for '{arxiv_id}'"}
+        if response.status_code >= 400:
+            return {"error": "API_ERROR", "status_code": response.status_code, "detail": response.text[:300]}
+        if not response.content.startswith(b"%PDF"):
+            return {"error": "NOT_A_PDF", "detail": "arXiv did not return a PDF for this id"}
+        return {"content": response.content}
 
     # ------------------------------------------------------------------
     def _parse_feed(self, xml_text: str) -> Dict[str, Any]:
